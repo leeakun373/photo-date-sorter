@@ -6,11 +6,15 @@
 
 from __future__ import annotations
 
+import csv
 import logging
 import os
+import re
 import shutil
 import sys
 import json
+import threading
+from functools import partial
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from ctypes import byref, create_unicode_buffer, windll
 from ctypes.wintypes import DWORD
@@ -26,8 +30,8 @@ try:
 except Exception:  # pragma: no cover - 打包/环境缺失时回退 Pillow
     exifread = None
 
-from PySide6.QtCore import QObject, QThread, Qt, Signal, Slot
-from PySide6.QtGui import QFont, QFontDatabase, QIcon
+from PySide6.QtCore import QObject, QThread, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QDesktopServices, QFont, QFontDatabase, QIcon
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -339,6 +343,101 @@ def unique_dest(dest: Path) -> Path:
     raise RuntimeError("无法生成唯一文件名: " + str(dest))
 
 
+# 与 FAT32/exFAT 时间戳精度兼容：已存在目标与源 size 相同且 mtime 足够接近则视为同一文件
+MTIME_DEDUP_TOLERANCE_SEC = 2.0
+
+# 匹配「原名_数字.扩展名」形式的旧版 unique_dest 副本（如 _DSC6997_1.JPG）
+DUP_NUMERIC_SUFFIX_RE = re.compile(r"^(.+)_(\d+)(\.[^.]+)$")
+
+# 仅将 _N 视为 unique_dest 生成的副本序号：N 必须 ≤ 此上限。
+# 相机常见「前缀_四位机身号」如 DSC_6997.JPG 会被正则拆成「原文件 DSC.jpg + 序号 6997」，
+# 若不做上限会把大量正常照片误判为候选；真实重复导入产生的副本多为 _1、_2…，序号通常远小于四位数。
+DUP_CLEANUP_INDEX_MAX = 999
+
+CLEANUP_REPORT_CSV_NAME = "cleanup_report.csv"
+
+
+@dataclass(frozen=True)
+class RedundantDupEntry:
+    candidate: Path
+    original: Path
+    size_bytes: int
+    mtime_diff_sec: float
+
+
+def app_run_directory() -> Path:
+    """程序运行目录：打包后为 exe 所在目录，源码运行为脚本所在目录。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def cleanup_report_csv_path() -> Path:
+    return app_run_directory() / CLEANUP_REPORT_CSV_NAME
+
+
+def collect_redundant_numeric_suffix_duplicates(root: Path) -> tuple[list[RedundantDupEntry], int]:
+    """
+    深度遍历 root，找出可安全删除的 _N 副本：同目录下存在「去掉 _N」的原文件，
+    且 size 相同、mtime 差在 MTIME_DEDUP_TOLERANCE_SEC 内。
+    仅当序号 N 满足 1 <= N <= DUP_CLEANUP_INDEX_MAX 时才参与（排除机身四位序号等误匹配）。
+    返回 (条目列表, 冗余文件总字节数)。
+    """
+    found: list[RedundantDupEntry] = []
+    total_bytes = 0
+    skipped_index_cap = 0
+    if not root.is_dir():
+        return found, total_bytes
+    for dirpath, _, filenames in os.walk(root):
+        base = Path(dirpath)
+        for name in filenames:
+            m = DUP_NUMERIC_SUFFIX_RE.match(name)
+            if not m:
+                continue
+            dup_index = int(m.group(2))
+            if dup_index < 1 or dup_index > DUP_CLEANUP_INDEX_MAX:
+                skipped_index_cap += 1
+                continue
+            base_stem = m.group(1)
+            ext = m.group(3)
+            original_name = base_stem + ext
+            candidate = base / name
+            original = base / original_name
+            if not original.is_file():
+                continue
+            try:
+                if candidate.resolve() == original.resolve():
+                    continue
+            except OSError:
+                continue
+            try:
+                c_st = candidate.stat()
+                o_st = original.stat()
+            except OSError:
+                continue
+            if c_st.st_size != o_st.st_size:
+                continue
+            mtime_diff = abs(c_st.st_mtime - o_st.st_mtime)
+            if mtime_diff > MTIME_DEDUP_TOLERANCE_SEC:
+                continue
+            found.append(
+                RedundantDupEntry(
+                    candidate=candidate,
+                    original=original,
+                    size_bytes=c_st.st_size,
+                    mtime_diff_sec=mtime_diff,
+                )
+            )
+            total_bytes += c_st.st_size
+    if skipped_index_cap:
+        LOG.info(
+            "冗余清理扫描：因「_序号 > %s」跳过 %s 个文件名（多为机身序号如 DSC_6997.JPG，非 unique_dest 副本）。",
+            DUP_CLEANUP_INDEX_MAX,
+            skipped_index_cap,
+        )
+    return found, total_bytes
+
+
 def find_camera_media_dir(
     target_volume_label: str = CAMERA_VOLUME_LABEL,
     relative_media_dir: Path = CAMERA_RELATIVE_MEDIA_DIR,
@@ -413,6 +512,7 @@ def plan_sort(
             if on_progress is not None:
                 on_progress("读取时间", idx, total, src.name)
 
+    skipped_dedup = 0
     for idx, src in enumerate(paths, start=1):
         dt, src_label = date_results[src]
         if on_progress is not None:
@@ -420,7 +520,25 @@ def plan_sort(
         rel = date_folder_name(dt, folder_pattern)
         dest_dir = out_root / rel
         dest_path = dest_dir / src.name
-        dest_path = unique_dest(dest_path)
+        try:
+            src_st = src.stat()
+        except OSError:
+            LOG.warning("无法读取源文件信息，跳过计划项：%s", src)
+            continue
+
+        if dest_path.exists():
+            try:
+                dest_st = dest_path.stat()
+            except OSError:
+                dest_st = None
+            if dest_st is not None:
+                if src_st.st_size == dest_st.st_size and abs(
+                    src_st.st_mtime - dest_st.st_mtime
+                ) <= MTIME_DEDUP_TOLERANCE_SEC:
+                    skipped_dedup += 1
+                    continue
+            dest_path = unique_dest(dest_path)
+
         planned.append(
             PlannedFile(
                 source=src,
@@ -429,6 +547,12 @@ def plan_sort(
                 dest_folder=dest_path.parent,
                 dest_path=dest_path,
             )
+        )
+    if skipped_dedup:
+        LOG.info(
+            "极快去重：跳过已导入文件 %s 个（size + mtime 在 %.1fs 内匹配）。",
+            skipped_dedup,
+            MTIME_DEDUP_TOLERANCE_SEC,
         )
     return planned
 
@@ -492,13 +616,19 @@ class ScanWorker(QObject):
 
 class RunWorker(QObject):
     progress = Signal(int, int, str, str)
-    finished_ok = Signal(int, int)
+    finished_ok = Signal(int, int, bool)  # ok, err, was_cancelled
     failed = Signal(str)
 
     def __init__(self, items: list[PlannedFile], do_move: bool) -> None:
         super().__init__()
         self._items = items
         self._do_move = do_move
+        self._cancel_event = threading.Event()
+
+    @Slot()
+    def cancel(self) -> None:
+        self._cancel_event.set()
+        LOG.info("收到取消指令，正在停止…")
 
     @Slot()
     def run(self) -> None:
@@ -506,9 +636,14 @@ class RunWorker(QObject):
         ok = 0
         err = 0
         mode = "移动" if self._do_move else "复制"
+        cancelled = False
         LOG.info("开始执行整理：模式=%s，共 %s 个文件。", mode, total)
         try:
             for i, pf in enumerate(self._items, start=1):
+                if self._cancel_event.is_set():
+                    cancelled = True
+                    LOG.info("任务已被用户取消（已完成 %s / %s 个文件的处理循环）。", i - 1, total)
+                    break
                 self.progress.emit(i, total, pf.source.name, str(pf.dest_path))
                 try:
                     pf.dest_folder.mkdir(parents=True, exist_ok=True)
@@ -522,10 +657,80 @@ class RunWorker(QObject):
                 except Exception:
                     LOG.exception("处理失败（%s）：%s", mode, pf.source)
                     err += 1
-            LOG.info("整理结束：成功 %s，失败 %s。", ok, err)
-            self.finished_ok.emit(ok, err)
+            if cancelled:
+                LOG.info("整理中止：用户取消；成功 %s，失败 %s。", ok, err)
+            else:
+                LOG.info("整理结束：成功 %s，失败 %s。", ok, err)
+            self.finished_ok.emit(ok, err, cancelled)
         except Exception as e:
             LOG.exception("整理过程异常中止")
+            self.failed.emit(str(e))
+
+
+class RedundantDupScanWorker(QObject):
+    """在后台线程扫描图库中的安全可删 _N 副本。"""
+
+    # 使用 JSON 字符串跨线程传递路径列表，避免 Signal(object/list, …) 在 PySide6 下偶发崩溃
+    finished = Signal(str, int)  # json 数组字符串, total_bytes
+    failed = Signal(str)
+
+    def __init__(self, root: str) -> None:
+        super().__init__()
+        self._root = root
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            r = Path(self._root)
+            if not r.is_dir():
+                self.failed.emit("输出目录不存在或不是文件夹。")
+                return
+            entries, total = collect_redundant_numeric_suffix_duplicates(r)
+            payload = json.dumps(
+                [
+                    {
+                        "candidate": str(e.candidate),
+                        "original": str(e.original),
+                        "size_bytes": e.size_bytes,
+                        "mtime_diff_sec": round(e.mtime_diff_sec, 6),
+                    }
+                    for e in entries
+                ],
+                ensure_ascii=False,
+            )
+            self.finished.emit(payload, total)
+        except Exception as e:
+            LOG.exception("扫描冗余副本失败")
+            self.failed.emit(str(e))
+
+
+class RedundantDupDeleteWorker(QObject):
+    """在后台线程删除已确认的冗余副本。"""
+
+    finished = Signal(int, int)  # ok_count, err_count
+    failed = Signal(str)
+
+    def __init__(self, paths: list[str]) -> None:
+        super().__init__()
+        self._paths = paths
+
+    @Slot()
+    def run(self) -> None:
+        ok = 0
+        err = 0
+        try:
+            for p in self._paths:
+                try:
+                    Path(p).unlink()
+                    ok += 1
+                    LOG.info("已删除冗余副本：%s", p)
+                except Exception:
+                    err += 1
+                    LOG.exception("删除失败：%s", p)
+            LOG.info("冗余副本清理结束：成功删除 %s，失败 %s。", ok, err)
+            self.finished.emit(ok, err)
+        except Exception as e:
+            LOG.exception("清理过程异常")
             self.failed.emit(str(e))
 
 
@@ -542,6 +747,10 @@ class MainWindow(QWidget):
         self._scan_worker: ScanWorker | None = None
         self._run_thread: QThread | None = None
         self._run_worker: RunWorker | None = None
+        self._dup_scan_thread: QThread | None = None
+        self._dup_scan_worker: RedundantDupScanWorker | None = None
+        self._dup_delete_thread: QThread | None = None
+        self._dup_delete_worker: RedundantDupDeleteWorker | None = None
         self._run_mode_cn = "复制"
         self._auto_run_after_scan = False
         self._skip_preview_table = False
@@ -562,10 +771,14 @@ class MainWindow(QWidget):
         self._out = QLineEdit()
         self._out.setPlaceholderText("整理后的根目录（将在此下创建按日期的子文件夹）")
         self._out.setText(self._cfg["library_root"])
+        btn_open_out = QPushButton("打开目标文件夹")
+        btn_open_out.setToolTip("在资源管理器中打开当前输出根目录")
+        btn_open_out.clicked.connect(self._open_output_folder)
         btn_out = QPushButton("浏览…")
         btn_out.clicked.connect(self._pick_out)
         out_row = QHBoxLayout()
         out_row.addWidget(self._out, 1)
+        out_row.addWidget(btn_open_out)
         out_row.addWidget(btn_out)
 
         self._recursive = QCheckBox("包含子文件夹中的照片/视频")
@@ -604,6 +817,15 @@ class MainWindow(QWidget):
         self._btn_run = QPushButton("执行整理")
         self._btn_run.setEnabled(False)
         self._btn_run.clicked.connect(self._start_run)
+        self._btn_cancel_run = QPushButton("取消执行")
+        self._btn_cancel_run.setEnabled(False)
+        self._btn_cancel_run.setToolTip("在复制/移动过程中安全停止后续文件（已完成的保留）")
+        self._btn_cancel_run.clicked.connect(self._on_cancel_run)
+        self._btn_clean_duplicates = QPushButton("清理旧重复文件")
+        self._btn_clean_duplicates.setToolTip(
+            "深度扫描输出目录：仅删除与同目录原文件大小、mtime 一致的 _1、_2 等旧版副本"
+        )
+        self._btn_clean_duplicates.clicked.connect(self._start_redundant_dup_scan)
         self._btn_import_card = QPushButton("一键导卡并整理")
         self._btn_import_card.clicked.connect(self._one_click_import)
         self._btn_history = QPushButton("整理历史照片")
@@ -633,6 +855,8 @@ class MainWindow(QWidget):
         bar_row.addWidget(self._btn_history)
         bar_row.addWidget(self._btn_scan)
         bar_row.addWidget(self._btn_run)
+        bar_row.addWidget(self._btn_cancel_run)
+        bar_row.addWidget(self._btn_clean_duplicates)
         bar_row.addStretch(1)
 
         self._phase = QLabel("当前阶段：就绪")
@@ -729,6 +953,53 @@ class MainWindow(QWidget):
     def _append_log(self, line: str) -> None:
         self._log.appendPlainText(line.rstrip("\n"))
 
+    def _bring_window_forward(self) -> None:
+        try:
+            self.raise_()
+            self.activateWindow()
+        except Exception:
+            LOG.exception("激活主窗口失败")
+
+    def _safe_information(self, title: str, text: str) -> None:
+        try:
+            QMessageBox.information(self, title, text)
+        except Exception:
+            LOG.exception("提示框显示失败：%s", title)
+        finally:
+            self._bring_window_forward()
+
+    def _safe_critical(self, title: str, text: str) -> None:
+        try:
+            QMessageBox.critical(self, title, text)
+        except Exception:
+            LOG.exception("错误框显示失败：%s", title)
+        finally:
+            self._bring_window_forward()
+
+    @Slot()
+    def _open_output_folder(self) -> None:
+        path = self._out.text().strip() or self._cfg_library_root.text().strip()
+        if not path:
+            QMessageBox.warning(self, "提示", "请先设置输出根目录或一键模式中的照片库目录。")
+            return
+        p = Path(path)
+        if not p.is_dir():
+            QMessageBox.warning(self, "提示", f"目录不存在：\n{path}")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(str(p.resolve()))
+            else:
+                QDesktopServices.openUrl(QUrl.fromLocalFile(str(p.resolve())))
+        except Exception as e:
+            LOG.exception("打开文件夹失败")
+            QMessageBox.critical(self, "错误", f"无法打开文件夹：{e}")
+
+    @Slot()
+    def _deferred_start_run_after_scan(self) -> None:
+        if self._plan:
+            self._start_run(skip_confirm=True)
+
     def _sync_out_with_src(self) -> None:
         if self._same_as_src.isChecked():
             t = self._src.text().strip()
@@ -801,6 +1072,7 @@ class MainWindow(QWidget):
         self._btn_import_card.setEnabled(False)
         self._btn_history.setEnabled(False)
         self._btn_run.setEnabled(False)
+        self._btn_clean_duplicates.setEnabled(False)
         self._plan.clear()
         self._table.setRowCount(0)
         self._phase.setText("当前阶段：扫描并生成预览")
@@ -868,6 +1140,7 @@ class MainWindow(QWidget):
         self._btn_import_card.setEnabled(True)
         self._btn_history.setEnabled(True)
         self._btn_run.setEnabled(bool(self._plan))
+        self._btn_clean_duplicates.setEnabled(True)
         self._progress.setVisible(False)
         self._progress.setFormat("%v / %m（%p%）")
         self._phase.setText("当前阶段：预览已就绪，等待执行")
@@ -880,9 +1153,11 @@ class MainWindow(QWidget):
             self._auto_run_after_scan = False
             self._skip_preview_table = False
             if self._plan:
-                self._start_run(skip_confirm=True)
+                QTimer.singleShot(0, self._deferred_start_run_after_scan)
             else:
-                QMessageBox.information(self, "提示", "未找到可整理的照片。")
+                QTimer.singleShot(
+                    0, partial(self._safe_information, "提示", "未找到可整理的照片。")
+                )
         else:
             self._skip_preview_table = False
 
@@ -892,12 +1167,13 @@ class MainWindow(QWidget):
         self._btn_scan.setEnabled(True)
         self._btn_import_card.setEnabled(True)
         self._btn_history.setEnabled(True)
+        self._btn_clean_duplicates.setEnabled(True)
         self._auto_run_after_scan = False
         self._skip_preview_table = False
         self._progress.setVisible(False)
         self._phase.setText("当前阶段：扫描失败")
         self._status.setText("扫描失败，详见日志。")
-        QMessageBox.critical(self, "扫描失败", msg)
+        QTimer.singleShot(0, partial(self._safe_critical, "扫描失败", msg))
 
     def _fill_table(self) -> None:
         self._table.setRowCount(len(self._plan))
@@ -930,6 +1206,8 @@ class MainWindow(QWidget):
         self._btn_import_card.setEnabled(False)
         self._btn_history.setEnabled(False)
         self._btn_run.setEnabled(False)
+        self._btn_clean_duplicates.setEnabled(False)
+        self._btn_cancel_run.setEnabled(True)
         self._phase.setText(f"当前阶段：正在{act}文件")
         self._status.setText(f"准备{act}，共 {n} 个文件…")
         self._progress.setVisible(True)
@@ -953,6 +1231,11 @@ class MainWindow(QWidget):
         self._run_thread.finished.connect(self._run_thread.deleteLater)
         self._run_thread.start()
 
+    @Slot()
+    def _on_cancel_run(self) -> None:
+        if self._run_worker is not None:
+            self._run_worker.cancel()
+
     @Slot(int, int, str, str)
     def _on_run_progress(self, cur: int, total: int, name: str, dest: str) -> None:
         self._progress.setMaximum(total)
@@ -968,22 +1251,41 @@ class MainWindow(QWidget):
         elif cur % 50 == 0 or cur == total:
             LOG.info("执行进度：%s / %s", cur, total)
 
-    @Slot(int, int)
-    def _on_run_done(self, ok: int, err: int) -> None:
+    @Slot(int, int, bool)
+    def _on_run_done(self, ok: int, err: int, was_cancelled: bool) -> None:
         self._run_worker = None
         self._btn_scan.setEnabled(True)
         self._btn_import_card.setEnabled(True)
         self._btn_history.setEnabled(True)
         self._btn_run.setEnabled(False)
+        self._btn_cancel_run.setEnabled(False)
+        self._btn_clean_duplicates.setEnabled(True)
         self._auto_run_after_scan = False
         self._progress.setVisible(False)
         self._plan.clear()
         self._table.setRowCount(0)
-        self._phase.setText("当前阶段：已完成")
-        self._status.setText(
-            f"完成：成功 {ok}，失败 {err}。可再次点击「扫描并预览」继续整理其他文件。"
-        )
-        QMessageBox.information(self, "完成", f"成功：{ok}\n失败：{err}")
+        if was_cancelled:
+            self._phase.setText("当前阶段：已取消")
+            self._status.setText(
+                f"已取消：成功 {ok}，失败 {err}。后续文件未处理；可再次扫描继续。"
+            )
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._safe_information,
+                    "已取消",
+                    f"任务已取消。\n成功：{ok}\n失败：{err}",
+                ),
+            )
+        else:
+            self._phase.setText("当前阶段：已完成")
+            self._status.setText(
+                f"完成：成功 {ok}，失败 {err}。可再次点击「扫描并预览」继续整理其他文件。"
+            )
+            QTimer.singleShot(
+                0,
+                partial(self._safe_information, "完成", f"成功：{ok}\n失败：{err}"),
+            )
 
     @Slot(str)
     def _on_run_err(self, msg: str) -> None:
@@ -992,11 +1294,258 @@ class MainWindow(QWidget):
         self._btn_import_card.setEnabled(True)
         self._btn_history.setEnabled(True)
         self._btn_run.setEnabled(True)
+        self._btn_cancel_run.setEnabled(False)
+        self._btn_clean_duplicates.setEnabled(True)
         self._auto_run_after_scan = False
         self._progress.setVisible(False)
         self._phase.setText("当前阶段：执行出错")
         self._status.setText("执行过程出错，详见日志。")
-        QMessageBox.critical(self, "错误", msg)
+        QTimer.singleShot(0, partial(self._safe_critical, "错误", msg))
+
+    def _start_redundant_dup_scan(self) -> None:
+        root = self._out.text().strip() or self._cfg_library_root.text().strip()
+        if not root:
+            QMessageBox.warning(self, "提示", "请先设置输出根目录或一键模式中的照片库目录。")
+            return
+        r = Path(root)
+        if not r.is_dir():
+            QMessageBox.warning(self, "提示", f"目录不存在：\n{root}")
+            return
+        self._btn_clean_duplicates.setEnabled(False)
+        self._btn_scan.setEnabled(False)
+        self._btn_import_card.setEnabled(False)
+        self._btn_history.setEnabled(False)
+        self._btn_run.setEnabled(False)
+        self._phase.setText("当前阶段：扫描冗余副本")
+        self._status.setText("正在深度遍历图库，查找可安全删除的 _1、_2 副本…")
+        self._progress.setVisible(True)
+        self._progress.setRange(0, 0)
+        self._progress.setFormat("扫描中…")
+
+        self._dup_scan_thread = QThread()
+        self._dup_scan_worker = RedundantDupScanWorker(str(r))
+        self._dup_scan_worker.moveToThread(self._dup_scan_thread)
+        self._dup_scan_thread.started.connect(self._dup_scan_worker.run)
+        self._dup_scan_worker.finished.connect(
+            self._on_dup_scan_done, Qt.QueuedConnection
+        )
+        self._dup_scan_worker.failed.connect(
+            self._on_dup_scan_failed, Qt.QueuedConnection
+        )
+        # 先处理结果再结束线程、再 deleteLater，降低竞态
+        self._dup_scan_worker.finished.connect(self._dup_scan_thread.quit)
+        self._dup_scan_worker.failed.connect(self._dup_scan_thread.quit)
+        self._dup_scan_thread.finished.connect(self._dup_scan_worker.deleteLater)
+        self._dup_scan_thread.finished.connect(self._dup_scan_thread.deleteLater)
+        self._dup_scan_thread.start()
+        LOG.info("冗余副本扫描已启动：%s", r)
+
+    @Slot(str, int)
+    def _on_dup_scan_done(self, paths_json: str, total_bytes: int) -> None:
+        self._dup_scan_worker = None
+        try:
+            raw = json.loads(paths_json)
+            if not isinstance(raw, list):
+                raise TypeError("扫描结果不是列表")
+            entries: list[dict[str, object]] = []
+            for item in raw:
+                if not isinstance(item, dict):
+                    raise TypeError("扫描结果项格式错误")
+                entries.append(
+                    {
+                        "candidate": str(item["candidate"]),
+                        "original": str(item["original"]),
+                        "size_bytes": int(item["size_bytes"]),
+                        "mtime_diff_sec": float(item["mtime_diff_sec"]),
+                    }
+                )
+        except Exception:
+            LOG.exception("解析冗余扫描结果失败，原始长度=%s", len(paths_json))
+            self._progress.setVisible(False)
+            self._phase.setText("当前阶段：就绪")
+            self._btn_scan.setEnabled(True)
+            self._btn_import_card.setEnabled(True)
+            self._btn_history.setEnabled(True)
+            self._btn_run.setEnabled(bool(self._plan))
+            self._btn_clean_duplicates.setEnabled(True)
+            self._status.setText("扫描结果解析失败，详见日志。")
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._safe_critical,
+                    "内部错误",
+                    "无法解析扫描结果，请查看日志文件。",
+                ),
+            )
+            return
+
+        self._progress.setVisible(False)
+        self._phase.setText("当前阶段：就绪")
+        self._btn_scan.setEnabled(True)
+        self._btn_import_card.setEnabled(True)
+        self._btn_history.setEnabled(True)
+        self._btn_run.setEnabled(bool(self._plan))
+        mb = total_bytes / (1024 * 1024) if total_bytes else 0.0
+        if not entries:
+            self._btn_clean_duplicates.setEnabled(True)
+            self._status.setText("未发现可安全清理的冗余副本。")
+            QTimer.singleShot(
+                0,
+                partial(
+                    self._safe_information,
+                    "扫描完成",
+                    "未发现可安全清理的冗余副本（需同目录存在原文件，且大小与修改时间一致）。",
+                ),
+            )
+            return
+        self._status.setText(
+            f"扫描完成：发现 {len(entries)} 个可删副本（约 {mb:.2f} MB），将导出 CSV 后确认…"
+        )
+        QTimer.singleShot(0, partial(self._prompt_redundant_dup_delete, entries))
+
+    @Slot(str)
+    def _on_dup_scan_failed(self, msg: str) -> None:
+        self._dup_scan_worker = None
+        self._progress.setVisible(False)
+        self._phase.setText("当前阶段：就绪")
+        self._btn_scan.setEnabled(True)
+        self._btn_import_card.setEnabled(True)
+        self._btn_history.setEnabled(True)
+        self._btn_run.setEnabled(bool(self._plan))
+        self._btn_clean_duplicates.setEnabled(True)
+        self._status.setText("冗余副本扫描失败，详见日志。")
+        QTimer.singleShot(0, partial(self._safe_critical, "扫描失败", msg))
+
+    def _write_cleanup_report_csv(self, entries: list[dict[str, object]]) -> Path:
+        path = cleanup_report_csv_path()
+        with path.open("w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["冗余副本路径", "推导原文件路径", "大小(Bytes)", "修改时间差(秒)"])
+            for e in entries:
+                w.writerow(
+                    [
+                        e["candidate"],
+                        e["original"],
+                        e["size_bytes"],
+                        e["mtime_diff_sec"],
+                    ]
+                )
+        LOG.info("待清理明细已写入：%s（共 %s 行）", path, len(entries))
+        return path
+
+    def _prompt_redundant_dup_delete(self, entries: list[dict[str, object]]) -> None:
+        count = len(entries)
+        total_b = sum(int(e["size_bytes"]) for e in entries)
+        mb = total_b / (1024 * 1024)
+        delete_started = False
+        try:
+            try:
+                report_path = self._write_cleanup_report_csv(entries)
+            except Exception as ex:
+                LOG.exception("写入 cleanup_report.csv 失败")
+                QMessageBox.critical(
+                    self,
+                    "导出失败",
+                    f"无法写入待清理明细 CSV：{ex}",
+                )
+                self._status.setText("导出 CSV 失败，未执行删除。")
+                self._btn_clean_duplicates.setEnabled(True)
+                return
+
+            QMessageBox.information(
+                self,
+                "已导出待清理明细",
+                f"已将待清理明细导出至：\n{report_path}\n\n"
+                f"共 {count} 行，约 {mb:.2f} MB。\n\n"
+                "请用 Excel 或记事本打开 cleanup_report.csv，核对「冗余副本路径」与"
+                "「推导原文件路径」无误后，再在下一步选择是否删除。\n\n"
+                "选择「否」将只保留此 CSV，不会删除文件。",
+            )
+        finally:
+            self._bring_window_forward()
+
+        try:
+            r = QMessageBox.question(
+                self,
+                "确认清理",
+                f"扫描到 {count} 个冗余副本，明细已保存为：\n{CLEANUP_REPORT_CSV_NAME}\n\n"
+                "规则摘要：序号在 "
+                f"1～{DUP_CLEANUP_INDEX_MAX}；与同目录原文件大小一致；"
+                f"mtime 相差 ≤ {MTIME_DEDUP_TOLERANCE_SEC:.1f} 秒。\n\n"
+                "是否立即从磁盘删除这些「冗余副本」文件？\n"
+                "（选「否」仅保留 CSV，不删除。）",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if r == QMessageBox.Yes:
+                delete_started = True
+                paths_only = [str(e["candidate"]) for e in entries]
+                self._start_dup_delete(paths_only)
+            else:
+                LOG.info("用户选择不删除冗余副本，仅保留 CSV。")
+                self._status.setText("已取消删除；明细见 cleanup_report.csv。")
+        finally:
+            self._bring_window_forward()
+            if not delete_started:
+                self._btn_clean_duplicates.setEnabled(True)
+
+    def _start_dup_delete(self, paths: list[str]) -> None:
+        self._btn_clean_duplicates.setEnabled(False)
+        self._btn_scan.setEnabled(False)
+        self._btn_import_card.setEnabled(False)
+        self._btn_history.setEnabled(False)
+        self._btn_run.setEnabled(False)
+        self._phase.setText("当前阶段：删除冗余副本")
+        self._status.setText(f"正在删除 {len(paths)} 个文件…")
+        self._progress.setVisible(True)
+        self._progress.setRange(0, 0)
+        self._progress.setFormat("删除中…")
+
+        self._dup_delete_thread = QThread()
+        self._dup_delete_worker = RedundantDupDeleteWorker(paths)
+        self._dup_delete_worker.moveToThread(self._dup_delete_thread)
+        self._dup_delete_thread.started.connect(self._dup_delete_worker.run)
+        self._dup_delete_worker.finished.connect(
+            self._on_dup_delete_done, Qt.QueuedConnection
+        )
+        self._dup_delete_worker.failed.connect(
+            self._on_dup_delete_failed, Qt.QueuedConnection
+        )
+        self._dup_delete_worker.finished.connect(self._dup_delete_thread.quit)
+        self._dup_delete_worker.failed.connect(self._dup_delete_thread.quit)
+        self._dup_delete_thread.finished.connect(self._dup_delete_worker.deleteLater)
+        self._dup_delete_thread.finished.connect(self._dup_delete_thread.deleteLater)
+        self._dup_delete_thread.start()
+        LOG.info("冗余副本删除已启动：%s 个文件", len(paths))
+
+    @Slot(int, int)
+    def _on_dup_delete_done(self, ok: int, err: int) -> None:
+        self._dup_delete_worker = None
+        self._progress.setVisible(False)
+        self._phase.setText("当前阶段：就绪")
+        self._btn_scan.setEnabled(True)
+        self._btn_import_card.setEnabled(True)
+        self._btn_history.setEnabled(True)
+        self._btn_run.setEnabled(bool(self._plan))
+        self._btn_clean_duplicates.setEnabled(True)
+        self._status.setText(f"清理完成：成功删除 {ok}，失败 {err}。")
+        QTimer.singleShot(
+            0,
+            partial(self._safe_information, "清理完成", f"成功删除：{ok}\n失败：{err}"),
+        )
+
+    @Slot(str)
+    def _on_dup_delete_failed(self, msg: str) -> None:
+        self._dup_delete_worker = None
+        self._progress.setVisible(False)
+        self._phase.setText("当前阶段：就绪")
+        self._btn_scan.setEnabled(True)
+        self._btn_import_card.setEnabled(True)
+        self._btn_history.setEnabled(True)
+        self._btn_run.setEnabled(bool(self._plan))
+        self._btn_clean_duplicates.setEnabled(True)
+        self._status.setText("清理过程出错，详见日志。")
+        QTimer.singleShot(0, partial(self._safe_critical, "清理失败", msg))
 
     def _one_click_import(self) -> None:
         if not self._save_quick_config(notify=False):

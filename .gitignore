@@ -8,6 +8,9 @@ venv/
 
 build/
 dist/
+dist_release/
 logs/
+
+*.zip
 
 *.spec
